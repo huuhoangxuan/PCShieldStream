@@ -1,6 +1,7 @@
 package com.pcshieldstream
 
 import android.net.Uri
+import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -69,8 +70,12 @@ class MainActivity : ComponentActivity() {
 private fun ShieldApp() {
     val context = LocalContext.current
     val activity = context as ComponentActivity
-    var server by remember { mutableStateOf("http://192.168.1.20:8787") }
-    var serverInput by remember { mutableStateOf(server) }
+    // Keep the last PC server address across app launches.
+    val preferences = remember { context.getSharedPreferences("pcshieldstream_settings", Context.MODE_PRIVATE) }
+    val defaultServer = "http://192.168.31.188:8787"
+    val initialServer = remember { preferences.getString("server_url", defaultServer) ?: defaultServer }
+    var server by remember { mutableStateOf(initialServer) }
+    var serverInput by remember { mutableStateOf(initialServer) }
     var connected by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
@@ -92,6 +97,11 @@ private fun ShieldApp() {
             } catch (e: Exception) { error = "Không kết nối được: ${e.message ?: "kiểm tra IP và mạng LAN"}"; connected = false }
             loading = false
         }
+    }
+
+    // Automatically reconnect to the saved PC when the app opens.
+    LaunchedEffect(Unit) {
+        request("")
     }
 
     fun play(entry: MediaEntry) {
@@ -211,7 +221,13 @@ private fun ShieldApp() {
                     Spacer(Modifier.height(6.dp))
                     Text("SERVER PC", color = Muted, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                     OutlinedTextField(value = serverInput, onValueChange = { serverInput = it }, label = { Text("http://IP:8787") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    Button(onClick = { server = serverInput.trim().trimEnd('/'); request("") }, modifier = Modifier.fillMaxWidth(), enabled = !loading) { Text(if (loading) "Đang kết nối…" else "Kết nối") }
+                    Button(onClick = {
+                        val address = serverInput.trim().trimEnd('/')
+                        serverInput = address
+                        server = address
+                        preferences.edit().putString("server_url", address).apply()
+                        request("")
+                    }, modifier = Modifier.fillMaxWidth(), enabled = !loading) { Text(if (loading) "Đang kết nối…" else "Kết nối") }
                     Text(if (connected) "● Đã kết nối" else "○ Chưa kết nối", color = if (connected) Accent else Muted, fontSize = 12.sp)
                     Spacer(Modifier.weight(1f))
                     Text("PCShieldStream 1.0", color = Muted, fontSize = 11.sp)
