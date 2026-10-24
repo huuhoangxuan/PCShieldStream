@@ -4,8 +4,10 @@ import android.net.Uri
 import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
@@ -88,10 +90,16 @@ private fun ShieldApp() {
     var entries by remember { mutableStateOf<List<MediaEntry>>(emptyList()) }
     var playing by remember { mutableStateOf<MediaEntry?>(null) }
     var player by remember { mutableStateOf<ExoPlayer?>(null) }
-    var playerView by remember { mutableStateOf<PlayerView?>(null) }
     var savedPosition by remember { mutableLongStateOf(0L) }
     var playbackError by remember { mutableStateOf("") }
     var playbackStatus by remember { mutableStateOf("Đang khởi tạo trình phát…") }
+    var searchQuery by remember { mutableStateOf("") }
+    var sortBySize by remember { mutableStateOf(false) }
+    val visibleEntries = remember(entries, searchQuery, sortBySize) {
+        val filtered = entries.filter { it.name.contains(searchQuery.trim(), ignoreCase = true) }
+        if (sortBySize) filtered.sortedWith(compareBy<MediaEntry>({ it.type != "dir" }, { -it.size }, { it.name.lowercase(Locale.ROOT) }))
+        else filtered.sortedWith(compareBy<MediaEntry>({ it.type != "dir" }, { it.name.lowercase(Locale.ROOT) }))
+    }
 
     fun request(path: String) {
         loading = true; error = ""
@@ -120,7 +128,8 @@ private fun ShieldApp() {
                 val httpFactory = DefaultHttpDataSource.Factory()
                     .setUserAgent("PCShieldStream/1.1 (Android TV)")
                     .setConnectTimeoutMs(15_000)
-                    .setReadTimeoutMs(30_000)
+                    .setReadTimeoutMs(60_000)
+                    .setDefaultRequestProperties(mapOf("Accept" to "*/*", "Connection" to "keep-alive"))
                     .setAllowCrossProtocolRedirects(true)
                 val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
                 val exo = ExoPlayer.Builder(context)
@@ -155,7 +164,6 @@ private fun ShieldApp() {
                     val mime = when (ext) { "ass", "ssa" -> "text/x-ssa"; "vtt" -> "text/vtt"; else -> "application/x-subrip" }
                     itemBuilder.setSubtitleConfigurations(listOf(MediaItem.SubtitleConfiguration.Builder(Uri.parse(Api.url(server, "/subtitle", subtitle.path))).setMimeType(mime).setLanguage("und").setSelectionFlags(C.SELECTION_FLAG_DEFAULT).build()))
                 }
-                player?.release()
                 player = exo
                 exo.setMediaItem(itemBuilder.build(), position)
                 exo.prepare()
@@ -180,19 +188,51 @@ private fun ShieldApp() {
         }
     }
 
+    fun closePlayback() {
+        val activePlayer = player
+        val item = playing
+        val position = activePlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        if (activePlayer != null && item != null) {
+            activity.lifecycleScope.launch(Dispatchers.IO) {
+                runCatching { Api.saveProgress(server, item.path, position) }
+            }
+        }
+        // DisposableEffect releases the old player after state changes, avoiding double-release.
+        player = null
+        playing = null
+        playbackError = ""
+        request(currentPath)
+    }
+
+    BackHandler(enabled = playing != null || currentPath.isNotBlank()) {
+        if (playing != null) closePlayback()
+        else {
+            val parent = currentPath.substringBeforeLast('/', "")
+            request(parent)
+        }
+    }
+
     DisposableEffect(player) {
-        onDispose { player?.release() }
+        val activePlayer = player
+        onDispose { activePlayer?.release() }
     }
 
     MaterialTheme(colorScheme = darkColorScheme(background = Bg, surface = Panel, primary = Accent, onBackground = Color.White, onSurface = Color.White)) {
-        if (playing != null && player != null) {
+        if (playing != null && player == null) {
+            Box(Modifier.fillMaxSize().background(Bg), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    CircularProgressIndicator(color = Accent)
+                    Text(playbackError.ifBlank { playbackStatus }, color = if (playbackError.isBlank()) Color.White else Color(0xFFFF9B9B))
+                    TextButton(onClick = { closePlayback() }) { Text("Hủy") }
+                }
+            }
+        } else if (playing != null && player != null) {
             Column(Modifier.fillMaxSize().background(Color.Black)) {
                 AndroidView(factory = { ctx ->
                     PlayerView(ctx).apply {
                         useController = true
                         this.player = player
                         keepScreenOn = true
-                        playerView = this
                     }
                 }, update = { it.player = player }, modifier = Modifier.fillMaxWidth().weight(1f))
                 Row(Modifier.fillMaxWidth().background(Panel).padding(horizontal = 24.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -210,10 +250,7 @@ private fun ShieldApp() {
                         Text(playbackError.ifBlank { playbackStatus }, color = if (playbackError.isBlank()) Muted else Color(0xFFFF9B9B), maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 11.sp)
                     }
                     OutlinedButton(onClick = {
-                        val p = player; val item = playing
-                        if (p != null && item != null) activity.lifecycleScope.launch(Dispatchers.IO) { runCatching { Api.saveProgress(server, item.path, p.currentPosition) } }
-                        player?.release(); player = null; playing = null
-                        request(currentPath)
+                        closePlayback()
                     }) { Text("Đóng") }
                 }
             }
@@ -235,11 +272,18 @@ private fun ShieldApp() {
                     }, modifier = Modifier.fillMaxWidth(), enabled = !loading) { Text(if (loading) "Đang kết nối…" else "Kết nối") }
                     Text(if (connected) "● Đã kết nối" else "○ Chưa kết nối", color = if (connected) Accent else Muted, fontSize = 12.sp)
                     Spacer(Modifier.weight(1f))
-                    Text("PCShieldStream 1.0", color = Muted, fontSize = 11.sp)
+                    Text("PCShieldStream 1.2.0", color = Muted, fontSize = 11.sp)
                 }
                 Column(Modifier.fillMaxSize().padding(horizontal = 30.dp, vertical = 24.dp)) {
-                    Text(if (currentPath.isBlank()) "Thư viện phim" else currentPath.substringAfter(':').ifBlank { "Thư viện phim" }, color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-                    Text("Phát trực tiếp từ PC · Không chuyển mã", color = Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 5.dp, bottom = 18.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.weight(1f)) {
+                            Text(if (currentPath.isBlank()) "Thư viện phim" else currentPath.substringAfter(':').ifBlank { "Thư viện phim" }, color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                            Text("Phát trực tiếp từ PC · Không chuyển mã", color = Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 5.dp))
+                        }
+                        OutlinedTextField(value = searchQuery, onValueChange = { searchQuery = it }, label = { Text("Tìm phim / thư mục") }, singleLine = true, modifier = Modifier.width(260.dp))
+                        OutlinedButton(onClick = { sortBySize = !sortBySize }) { Text(if (sortBySize) "Sắp xếp: dung lượng" else "Sắp xếp: tên") }
+                    }
+                    Spacer(Modifier.height(14.dp))
                     if (currentPath.isNotBlank()) {
                         TextButton(onClick = { val parent = currentPath.substringBeforeLast('/', ""); request(if (parent.endsWith(":")) parent else parent) }) { Text("← Quay lại") }
                     }
@@ -250,7 +294,7 @@ private fun ShieldApp() {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Thư mục này chưa có video được hỗ trợ", color = Muted) }
                     } else {
                         LazyVerticalGrid(columns = GridCells.Adaptive(minSize = 150.dp), verticalArrangement = Arrangement.spacedBy(14.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
-                            gridItems(entries, key = { it.path }) { entry ->
+                            gridItems(visibleEntries, key = { it.path }) { entry ->
                                 var posterUrl by remember(entry.path, server) { mutableStateOf<String?>(null) }
                                 var posterChecked by remember(entry.path, server) { mutableStateOf(false) }
                                 LaunchedEffect(entry.path, server) {
@@ -259,7 +303,7 @@ private fun ShieldApp() {
                                         posterUrl = withContext(Dispatchers.IO) { runCatching { Api.poster(server, entry.path) }.getOrNull() }
                                     }
                                 }
-                                Column(Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(14.dp)).clickable {
+                                Column(Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(14.dp)).border(1.dp, Color(0xFF273448), RoundedCornerShape(14.dp)).clickable {
                                     if (entry.type == "dir") request(entry.path) else play(entry)
                                 }.focusable().padding(9.dp)) {
                                     Box(Modifier.fillMaxWidth().height(190.dp).background(Color(0xFF202A3A), RoundedCornerShape(9.dp)), contentAlignment = Alignment.Center) {
@@ -303,7 +347,7 @@ private object Api {
     }
     fun poster(base: String, path: String): String? {
         val obj = JSONObject(get("${base.trimEnd('/')}/api/poster?path=${enc(path)}"))
-        return obj.optString("poster").takeIf { it.isNotBlank() && it != "null" }
+        return obj.optString("poster").takeIf { it.isNotBlank() && it != "null" && it.startsWith("https://") }
     }
     fun progress(base: String, path: String): Long = JSONObject(get("${base.trimEnd('/')}/api/progress?path=${enc(path)}")).optLong("positionMs",0)
     fun saveProgress(base: String, path: String, position: Long) {

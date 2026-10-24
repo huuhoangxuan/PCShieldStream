@@ -1,14 +1,12 @@
-# Cách tạo APK không cần cài Android Studio/SDK trên PC
+# Build the APK with GitHub Actions
 
-Workflow GitHub Actions đã được thêm ở `.github/workflows/build-apk.yml`.
+1. Upload/commit this entire source tree to the repository root, preserving `.github/workflows/build-apk.yml`.
+2. Open GitHub → **Actions** → **Build PCShieldStream APK**.
+3. If no run started automatically, choose **Run workflow**.
+4. Open the newest run. Wait for the `build` job to show green.
+5. In **Artifacts**, download `PCShieldStream-debug-apk` and extract `app-debug.apk`.
+6. Install it on NVIDIA Shield and test playback with a small MP4 and an MKV.
 
-1. Tạo một repository GitHub mới (có thể để Private).
-2. Upload toàn bộ nội dung thư mục `PCShieldStream` lên repository, giữ nguyên thư mục `.github/workflows` (nếu không thấy `.github`, bật hiển thị file ẩn hoặc upload qua Git).
-3. Mở tab **Actions** của repository.
-4. Chọn **Build PCShieldStream APK** ở cột trái.
-5. Nhấn **Run workflow** → **Run workflow**.
-6. Chờ workflow xanh (Success), mở lần chạy đó và tải artifact **PCShieldStream-debug-apk**. Giải nén artifact để lấy `app-debug.apk`.
+The workflow uses Java 17, Gradle 8.9, Android SDK Platform 35, Build Tools 35.0.0, and only the supported `platform-tools` package during Android SDK setup. This avoids the obsolete SDK package named `tools`.
 
-APK được tạo trên runner Linux sạch với JDK 17, Android SDK 35 và Gradle 8.9. Nếu build lỗi, mở workflow và xem log bước đỏ đầu tiên.
-
-Lưu ý: đây là debug APK để cài thử trong mạng LAN, không phải bản phát hành ký số. Không commit token hay thông tin cá nhân vào repository.
+A green workflow means the APK compiled successfully; it does not guarantee playback has been verified on physical Shield hardware.

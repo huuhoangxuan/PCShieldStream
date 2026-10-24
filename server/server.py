@@ -31,11 +31,16 @@ def clean_media_title(filename):
     stem=Path(filename).stem
     stem=re.sub(r'[._]+',' ',stem)
     stem=re.sub(r'\[[^\]]*\]|\([^)]*(?:1080p|2160p|720p|x264|x265|hevc|bluray|web.?dl|hdr|dv)[^)]*\)',' ',stem,flags=re.I)
-    stem=re.sub(r'(2160p|1080p|720p|480p|4k|8k|x264|x265|h264|h265|hevc|av1|bluray|blu.?ray|web.?dl|webrip|brrip|hdr10\+?|dv|dovi|aac\d*|dts(?:-hd)?|truehd|proper|repack|remux)',' ',stem,flags=re.I)
+    stem=re.sub(r'\b(2160p|1080p|720p|480p|4k|8k|x264|x265|h264|h265|hevc|av1|bluray|blu.?ray|web.?dl|webrip|brrip|hdr10\+?|dv|dovi|aac\d*|dts(?:-hd)?|truehd|proper|repack|remux)\b',' ',stem,flags=re.I)
+    # Remove TV episode tokens so lookup searches for the series title.
+    stem=re.sub(r'\bS\d{1,2}E\d{1,2}\b.*$', ' ', stem, flags=re.I)
+    stem=re.sub(r'\bSeason\s*\d+\s*Episode\s*\d+\b.*$', ' ', stem, flags=re.I)
     stem=re.sub(r'\s+',' ',stem).strip(' -_')
-    year_match=re.search(r'(19\d{2}|20\d{2})',stem)
+    year_match=re.search(r'\b(19\d{2}|20\d{2})\b',stem)
     year=year_match.group(1) if year_match else None
-    if year_match: stem=stem[:year_match.start()].strip(' -_')
+    if year_match: stem=stem[:year_match.start()].strip(' -_(')
+    stem=re.sub(r'[()\[\]]',' ',stem)
+    stem=re.sub(r'\s+',' ',stem).strip(' -_')
     return stem or Path(filename).stem, year
 
 def lookup_poster(filename):
@@ -76,14 +81,29 @@ def resolve_path(raw):
 def roots_json(): return [{'path':str(p),'name':p.name or str(p),'id':str(i)} for i,p in enumerate(ROOTS)]
 def child_path(parent, name): return parent + name if parent.endswith(':') else parent.rstrip('/') + '/' + name
 class Handler(BaseHTTPRequestHandler):
-    server_version='PCShieldStream/1.0'
+    server_version='PCShieldStream/1.2.0'
     def log_message(self, fmt, *args): print('[%s] %s' % (self.address_string(), fmt%args))
     def send_json(self, obj, status=200):
         data=json.dumps(obj,ensure_ascii=False).encode('utf-8'); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(data))); self.send_header('Access-Control-Allow-Origin','*'); self.end_headers(); self.wfile.write(data)
+    def do_HEAD(self):
+        u=urllib.parse.urlparse(self.path); q=urllib.parse.parse_qs(u.query)
+        if u.path not in ('/stream','/subtitle'):
+            return self.send_error(404)
+        try:
+            p=resolve_path(q.get('path',[''])[0])
+            if not p.is_file(): return self.send_error(404)
+            if u.path=='/stream' and p.suffix.lower() not in VIDEO_EXTS: return self.send_error(415)
+            if u.path=='/subtitle' and p.suffix.lower() not in SUB_EXTS: return self.send_error(415)
+            size=p.stat().st_size
+            mime=mimetypes.guess_type(str(p))[0] or ('text/plain' if u.path=='/subtitle' else 'application/octet-stream')
+            self.send_response(200); self.send_header('Content-Type',mime); self.send_header('Content-Length',str(size)); self.send_header('Accept-Ranges','bytes'); self.end_headers()
+        except (ValueError,PermissionError) as e: return self.send_json({'error':str(e)},400)
+        except FileNotFoundError: return self.send_error(404)
+
     def do_GET(self):
         u=urllib.parse.urlparse(self.path); q=urllib.parse.parse_qs(u.query)
         try:
-            if u.path=='/api/health': return self.send_json({'ok':True,'name':'PCShieldStream','version':1})
+            if u.path=='/api/health': return self.send_json({'ok':True,'name':'PCShieldStream','version':'1.2.0'})
             if u.path=='/api/roots': return self.send_json({'roots':roots_json()})
             if u.path=='/api/list':
                 raw=q.get('path',[''])[0]
@@ -112,9 +132,12 @@ class Handler(BaseHTTPRequestHandler):
                     cached=POSTER_CACHE.get(cache_key)
                     if cached is not None: return self.send_json(cached)
                 result=lookup_poster(p.name)
-                with POSTER_LOCK:
-                    POSTER_CACHE[cache_key]=result
-                    save_poster_cache()
+                # Cache only successful lookups. A temporary network failure must not
+                # permanently suppress poster lookup for this file.
+                if result.get('poster'):
+                    with POSTER_LOCK:
+                        POSTER_CACHE[cache_key]=result
+                        save_poster_cache()
                 return self.send_json(result)
             if u.path=='/api/progress':
                 p=q.get('path',[''])[0]
@@ -130,9 +153,17 @@ class Handler(BaseHTTPRequestHandler):
                 if rng:
                     try:
                         unit, val=rng.split('=',1)
-                        if unit!='bytes': raise ValueError()
-                        a,b=val.split('-',1); start=int(a) if a else max(0,size-int(b)); end=int(b) if a and b else size-1
-                        if start> end or start>=size: self.send_response(416); self.send_header('Content-Range',f'bytes */{size}'); self.end_headers(); return
+                        if unit.strip().lower()!='bytes' or ',' in val or size <= 0: raise ValueError()
+                        a,b=val.strip().split('-',1)
+                        if not a and not b: raise ValueError()
+                        if not a:
+                            suffix=int(b)
+                            if suffix <= 0: raise ValueError()
+                            start=max(0,size-suffix); end=size-1
+                        else:
+                            start=int(a); end=int(b) if b else size-1
+                        if start < 0 or start >= size or end < start:
+                            self.send_response(416); self.send_header('Content-Range',f'bytes */{size}'); self.send_header('Content-Length','0'); self.end_headers(); return
                         end=min(end,size-1); status=206
                     except Exception: return self.send_error(416)
                 mime=mimetypes.guess_type(str(p))[0] or ('text/plain' if u.path=='/subtitle' else 'application/octet-stream')
@@ -153,6 +184,10 @@ class Handler(BaseHTTPRequestHandler):
                     print('[stream] client closed connection before transfer completed:', p.name)
                 return
             return self.send_error(404)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # A TV player may cancel a request while probing a file or seeking.
+            # The peer is already gone, so do not attempt to write an HTTP 500.
+            print('[http] client disconnected during response')
         except (ValueError,PermissionError) as e: return self.send_json({'error':str(e)},400)
         except FileNotFoundError: return self.send_error(404)
         except Exception as e: print('ERROR',repr(e)); return self.send_error(500)
