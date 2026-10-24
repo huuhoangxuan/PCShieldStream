@@ -9,6 +9,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -19,6 +22,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -244,17 +249,30 @@ private fun ShieldApp() {
                     } else if (entries.isEmpty() && !loading) {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Thư mục này chưa có video được hỗ trợ", color = Muted) }
                     } else {
-                        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(entries, key = { it.path }) { entry ->
-                                Row(Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(12.dp)).clickable {
-                                    if (entry.type == "dir") request(entry.path) else play(entry)
-                                }.focusable().padding(horizontal = 18.dp, vertical = 15.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Text(if (entry.type == "dir") "▰" else "▶", color = Accent, fontSize = 22.sp, modifier = Modifier.width(42.dp))
-                                    Column(Modifier.weight(1f)) {
-                                        Text(entry.name, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        Text(if (entry.type == "dir") "Thư mục" else formatSize(entry.size), color = Muted, fontSize = 12.sp)
+                        LazyVerticalGrid(columns = GridCells.Adaptive(minSize = 150.dp), verticalArrangement = Arrangement.spacedBy(14.dp), horizontalArrangement = Arrangement.spacedBy(14.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
+                            gridItems(entries, key = { it.path }) { entry ->
+                                var posterUrl by remember(entry.path, server) { mutableStateOf<String?>(null) }
+                                var posterChecked by remember(entry.path, server) { mutableStateOf(false) }
+                                LaunchedEffect(entry.path, server) {
+                                    if (entry.type != "dir" && !posterChecked) {
+                                        posterChecked = true
+                                        posterUrl = withContext(Dispatchers.IO) { runCatching { Api.poster(server, entry.path) }.getOrNull() }
                                     }
-                                    Text(if (entry.type == "dir") "MỞ  ›" else "PHÁT  ›", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Column(Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(14.dp)).clickable {
+                                    if (entry.type == "dir") request(entry.path) else play(entry)
+                                }.focusable().padding(9.dp)) {
+                                    Box(Modifier.fillMaxWidth().height(190.dp).background(Color(0xFF202A3A), RoundedCornerShape(9.dp)), contentAlignment = Alignment.Center) {
+                                        if (entry.type != "dir" && !posterUrl.isNullOrBlank()) {
+                                            AsyncImage(model = posterUrl, contentDescription = entry.name, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                                        } else {
+                                            Text(if (entry.type == "dir") "📁" else "▶", color = Accent, fontSize = 42.sp)
+                                        }
+                                        if (entry.type == "video") Box(Modifier.align(Alignment.BottomEnd).padding(8.dp).background(Color(0xCC05070C), RoundedCornerShape(7.dp)).padding(horizontal = 9.dp, vertical = 5.dp)) { Text("▶ PHÁT", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
+                                    }
+                                    Spacer(Modifier.height(10.dp))
+                                    Text(entry.name.substringBeforeLast('.', entry.name), color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis, minLines = 2)
+                                    Text(if (entry.type == "dir") "Thư mục" else formatSize(entry.size), color = Muted, fontSize = 11.sp, maxLines = 1)
                                 }
                             }
                         }
@@ -282,6 +300,10 @@ private object Api {
     fun subtitles(base: String, path: String): List<MediaEntry> {
         val obj=JSONObject(get("${base.trimEnd('/')}/api/subtitles?path=${enc(path)}")); val a=obj.getJSONArray("items")
         return (0 until a.length()).map { val x=a.getJSONObject(it); MediaEntry(x.getString("name"),x.getString("path"),"subtitle") }
+    }
+    fun poster(base: String, path: String): String? {
+        val obj = JSONObject(get("${base.trimEnd('/')}/api/poster?path=${enc(path)}"))
+        return obj.optString("poster").takeIf { it.isNotBlank() && it != "null" }
     }
     fun progress(base: String, path: String): Long = JSONObject(get("${base.trimEnd('/')}/api/progress?path=${enc(path)}")).optLong("positionMs",0)
     fun saveProgress(base: String, path: String, position: Long) {

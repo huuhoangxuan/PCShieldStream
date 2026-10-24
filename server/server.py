@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PCShieldStream LAN media server. Python standard library only."""
-import argparse, json, mimetypes, os, socket, threading, urllib.parse
+import argparse, json, mimetypes, os, socket, threading, urllib.parse, urllib.request, re, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -8,7 +8,10 @@ VIDEO_EXTS={'.mkv','.mp4','.m4v','.mov','.avi','.webm','.ts','.m2ts','.mpg','.mp
 SUB_EXTS={'.srt','.ass','.ssa','.vtt'}
 ROOTS=[]
 DB_PATH=Path(__file__).with_name('progress.json')
+POSTER_DB_PATH=Path(__file__).with_name('posters.json')
 LOCK=threading.Lock()
+POSTER_LOCK=threading.Lock()
+POSTER_CACHE={}
 
 def load_db():
     try: return json.loads(DB_PATH.read_text('utf-8'))
@@ -16,6 +19,50 @@ def load_db():
 def save_db(db):
     tmp=DB_PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(db,ensure_ascii=False,indent=2),'utf-8'); tmp.replace(DB_PATH)
 def key_for(p): return str(p).casefold()
+def load_poster_cache():
+    global POSTER_CACHE
+    try: POSTER_CACHE=json.loads(POSTER_DB_PATH.read_text('utf-8'))
+    except Exception: POSTER_CACHE={}
+def save_poster_cache():
+    try:
+        tmp=POSTER_DB_PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(POSTER_CACHE,ensure_ascii=False,indent=2),'utf-8'); tmp.replace(POSTER_DB_PATH)
+    except Exception as e: print('[poster] cache save failed:',repr(e))
+def clean_media_title(filename):
+    stem=Path(filename).stem
+    stem=re.sub(r'[._]+',' ',stem)
+    stem=re.sub(r'\[[^\]]*\]|\([^)]*(?:1080p|2160p|720p|x264|x265|hevc|bluray|web.?dl|hdr|dv)[^)]*\)',' ',stem,flags=re.I)
+    stem=re.sub(r'(2160p|1080p|720p|480p|4k|8k|x264|x265|h264|h265|hevc|av1|bluray|blu.?ray|web.?dl|webrip|brrip|hdr10\+?|dv|dovi|aac\d*|dts(?:-hd)?|truehd|proper|repack|remux)',' ',stem,flags=re.I)
+    stem=re.sub(r'\s+',' ',stem).strip(' -_')
+    year_match=re.search(r'(19\d{2}|20\d{2})',stem)
+    year=year_match.group(1) if year_match else None
+    if year_match: stem=stem[:year_match.start()].strip(' -_')
+    return stem or Path(filename).stem, year
+
+def lookup_poster(filename):
+    title, year=clean_media_title(filename)
+    if not title: return {'poster':None,'title':Path(filename).stem}
+    encoded_title=urllib.parse.quote(title, safe='')
+    for kind in ('movie','series'):
+        endpoint=f'https://v3-cinemeta.strem.io/catalog/{kind}/top/search={encoded_title}.json'
+        try:
+            req=urllib.request.Request(endpoint,headers={'User-Agent':'PCShieldStream/1.0','Accept':'application/json'})
+            with urllib.request.urlopen(req,timeout=4) as response: payload=json.loads(response.read().decode('utf-8','replace'))
+            metas=payload.get('metas',[])
+            if not metas: continue
+            norm=lambda x: re.sub(r'[^a-z0-9]','',str(x).lower())
+            exact=[m for m in metas if norm(m.get('name',''))==norm(title)]
+            choices=exact or metas
+            if year:
+                year_match=[m for m in choices if str(m.get('year',''))==year]
+                if year_match: choices=year_match
+            for meta in choices:
+                poster=meta.get('poster') or meta.get('posterShape')
+                if poster and str(poster).startswith('https://'):
+                    return {'poster':poster,'title':meta.get('name') or title,'year':meta.get('year')}
+        except Exception as e:
+            print('[poster] lookup failed for',title,':',repr(e))
+    return {'poster':None,'title':title}
+
 def resolve_path(raw):
     # Client paths are root-index + relative path, never arbitrary absolute paths.
     raw=raw or ''
@@ -56,6 +103,19 @@ class Handler(BaseHTTPRequestHandler):
                     if x.is_file() and x.suffix.lower() in SUB_EXTS and x.stem.casefold().startswith(video.stem.casefold()):
                         subs.append({'name':x.name,'path':child_path(q.get('path',[''])[0].rsplit('/',1)[0] if '/' in q.get('path',[''])[0] else q.get('path',[''])[0].split(':',1)[0]+':', x.name)})
                 return self.send_json({'items':subs})
+            if u.path=='/api/poster':
+                raw=q.get('path',[''])[0]
+                p=resolve_path(raw)
+                if not p.is_file() or p.suffix.lower() not in VIDEO_EXTS: return self.send_json({'poster':None,'title':p.stem})
+                cache_key=key_for(p)
+                with POSTER_LOCK:
+                    cached=POSTER_CACHE.get(cache_key)
+                    if cached is not None: return self.send_json(cached)
+                result=lookup_poster(p.name)
+                with POSTER_LOCK:
+                    POSTER_CACHE[cache_key]=result
+                    save_poster_cache()
+                return self.send_json(result)
             if u.path=='/api/progress':
                 p=q.get('path',[''])[0]
                 with LOCK: value=load_db().get(p,0)
@@ -120,6 +180,7 @@ def main():
     ap.add_argument('--root',action='append',required=True,help='Allowed movie folder; repeat for multiple folders')
     ap.add_argument('--port',type=int,default=8787)
     args=ap.parse_args(); ROOTS=[]
+    load_poster_cache()
     for item in args.root:
         p=Path(item).expanduser().resolve()
         if not p.is_dir(): ap.error(f'Folder does not exist: {p}')
@@ -128,6 +189,7 @@ def main():
     print('\nPCShieldStream server running. Open one of these on Shield:')
     for ip in local_ips(): print(f'  http://{ip}:{args.port}')
     print('Allowed folders:'); [print('  -',p) for p in ROOTS]
+    print('Poster lookup: Cinemeta metadata (cached locally in posters.json)')
     print('Keep this window open while watching. Ctrl+C to stop.\n')
     try: httpd.serve_forever()
     except KeyboardInterrupt: print('\nStopping server...')

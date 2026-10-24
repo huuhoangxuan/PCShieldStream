@@ -53,3 +53,10 @@ If Network debugging uses a pairing port, pair with the code/port shown on the S
 - Progress is stored in `server/progress.json`, keyed by the relative root path. The server saves progress when the app is playing every five seconds and when playback is closed.
 - The server has no authentication or TLS. Keep it on a trusted home network and only expose selected movie folders.
 - This project is a starter implementation and has not been compiled or tested on a physical Shield in this environment. Build and test on the target device before relying on it.
+
+
+## Poster phim tự động và biểu tượng ứng dụng
+
+Bản cập nhật 1.1.0 hiển thị thư viện dạng lưới poster. PCShieldStream sẽ tìm poster theo tên file thông qua Cinemeta (cần PC có Internet); kết quả được lưu trong `server/posters.json` để dùng lại. Tên file phim càng rõ (tên phim + năm) thì kết quả càng chính xác. Nếu không tìm được poster, ứng dụng hiển thị biểu tượng phát mặc định.
+
+Khi cập nhật, thay các file trong thư mục `android/` và `server/server.py` bằng bản trong ZIP. Commit toàn bộ thay đổi lên GitHub để workflow tạo APK mới. Trên PC, khởi động lại server sau khi thay `server.py`.
