@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PCShieldStream LAN media server. Python standard library only."""
-import argparse, json, mimetypes, os, socket, threading, urllib.parse, urllib.request, re, time
+import argparse, difflib, ipaddress, json, mimetypes, os, socket, threading, urllib.parse, urllib.request, re, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -12,17 +12,27 @@ POSTER_DB_PATH=Path(__file__).with_name('posters.json')
 LOCK=threading.Lock()
 POSTER_LOCK=threading.Lock()
 POSTER_CACHE={}
+POSTER_LOOKUP_SEMAPHORE=threading.BoundedSemaphore(3)
+NEGATIVE_POSTER_TTL_SECONDS=6*60*60
+POSITIVE_POSTER_TTL_SECONDS=30*24*60*60
 
 def load_db():
     try: return json.loads(DB_PATH.read_text('utf-8'))
     except Exception: return {}
 def save_db(db):
-    tmp=DB_PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(db,ensure_ascii=False,indent=2),'utf-8'); tmp.replace(DB_PATH)
+    # Atomic replace prevents a partial JSON file if Windows shuts down mid-write.
+    tmp=DB_PATH.with_suffix('.tmp')
+    tmp.write_text(json.dumps(db,ensure_ascii=False,indent=2),'utf-8')
+    tmp.replace(DB_PATH)
+PROGRESS_DB=load_db()
 def key_for(p): return str(p).casefold()
 def load_poster_cache():
     global POSTER_CACHE
     try: POSTER_CACHE=json.loads(POSTER_DB_PATH.read_text('utf-8'))
     except Exception: POSTER_CACHE={}
+POSTER_LOOKUP_SEMAPHORE=threading.BoundedSemaphore(3)
+NEGATIVE_POSTER_TTL_SECONDS=6*60*60
+POSITIVE_POSTER_TTL_SECONDS=30*24*60*60
 def save_poster_cache():
     try:
         tmp=POSTER_DB_PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(POSTER_CACHE,ensure_ascii=False,indent=2),'utf-8'); tmp.replace(POSTER_DB_PATH)
@@ -45,28 +55,43 @@ def clean_media_title(filename):
 
 def lookup_poster(filename):
     title, year=clean_media_title(filename)
-    if not title: return {'poster':None,'title':Path(filename).stem}
+    if not title: return {'poster':None,'title':Path(filename).stem,'lookupFailed':False}
     encoded_title=urllib.parse.quote(title, safe='')
+    saw_error=False
     for kind in ('movie','series'):
         endpoint=f'https://v3-cinemeta.strem.io/catalog/{kind}/top/search={encoded_title}.json'
         try:
-            req=urllib.request.Request(endpoint,headers={'User-Agent':'PCShieldStream/1.0','Accept':'application/json'})
+            req=urllib.request.Request(endpoint,headers={'User-Agent':'PCShieldStream/1.3.0','Accept':'application/json'})
             with urllib.request.urlopen(req,timeout=4) as response: payload=json.loads(response.read().decode('utf-8','replace'))
             metas=payload.get('metas',[])
             if not metas: continue
             norm=lambda x: re.sub(r'[^a-z0-9]','',str(x).lower())
-            exact=[m for m in metas if norm(m.get('name',''))==norm(title)]
-            choices=exact or metas
+            normalized_title=norm(title)
+            exact=[m for m in metas if norm(m.get('name',''))==normalized_title]
+            if exact:
+                choices=exact
+            else:
+                # Do not blindly use the first catalog result: it can be a different movie.
+                ranked=sorted(metas,key=lambda m: difflib.SequenceMatcher(None,normalized_title,norm(m.get('name',''))).ratio(),reverse=True)
+                if not ranked or difflib.SequenceMatcher(None,normalized_title,norm(ranked[0].get('name',''))).ratio() < 0.78:
+                    continue
+                choices=ranked[:3]
             if year:
                 year_match=[m for m in choices if str(m.get('year',''))==year]
-                if year_match: choices=year_match
+                if year_match:
+                    choices=year_match
+                elif any(str(m.get('year','')).strip() for m in choices):
+                    # A known conflicting year is more dangerous than no poster.
+                    continue
             for meta in choices:
                 poster=meta.get('poster') or meta.get('posterShape')
                 if poster and str(poster).startswith('https://'):
-                    return {'poster':poster,'title':meta.get('name') or title,'year':meta.get('year')}
+                    return {'poster':poster,'title':meta.get('name') or title,'year':meta.get('year'),'lookupFailed':False}
         except Exception as e:
+            saw_error=True
             print('[poster] lookup failed for',title,':',repr(e))
-    return {'poster':None,'title':title}
+    # Distinguish a true no-result from a temporary network/API failure.
+    return {'poster':None,'title':title,'lookupFailed':saw_error}
 
 def resolve_path(raw):
     # Client paths are root-index + relative path, never arbitrary absolute paths.
@@ -81,7 +106,7 @@ def resolve_path(raw):
 def roots_json(): return [{'path':str(p),'name':p.name or str(p),'id':str(i)} for i,p in enumerate(ROOTS)]
 def child_path(parent, name): return parent + name if parent.endswith(':') else parent.rstrip('/') + '/' + name
 class Handler(BaseHTTPRequestHandler):
-    server_version='PCShieldStream/1.2.0'
+    server_version='PCShieldStream/1.3.0'
     def log_message(self, fmt, *args): print('[%s] %s' % (self.address_string(), fmt%args))
     def send_json(self, obj, status=200):
         data=json.dumps(obj,ensure_ascii=False).encode('utf-8'); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(data))); self.send_header('Access-Control-Allow-Origin','*'); self.end_headers(); self.wfile.write(data)
@@ -103,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u=urllib.parse.urlparse(self.path); q=urllib.parse.parse_qs(u.query)
         try:
-            if u.path=='/api/health': return self.send_json({'ok':True,'name':'PCShieldStream','version':'1.2.0'})
+            if u.path=='/api/health': return self.send_json({'ok':True,'name':'PCShieldStream','version':'1.3.0'})
             if u.path=='/api/roots': return self.send_json({'roots':roots_json()})
             if u.path=='/api/list':
                 raw=q.get('path',[''])[0]
@@ -118,30 +143,48 @@ class Handler(BaseHTTPRequestHandler):
                     except (PermissionError,OSError): pass
                 return self.send_json({'path':raw,'items':items})
             if u.path=='/api/subtitles':
-                video=resolve_path(q.get('path',[''])[0]); subs=[]
+                raw=q.get('path',[''])[0]; video=resolve_path(raw)
+                if not video.is_file() or video.suffix.lower() not in VIDEO_EXTS: return self.send_json({'items':[]})
+                subs=[]
                 for x in video.parent.iterdir():
-                    if x.is_file() and x.suffix.lower() in SUB_EXTS and x.stem.casefold().startswith(video.stem.casefold()):
-                        subs.append({'name':x.name,'path':child_path(q.get('path',[''])[0].rsplit('/',1)[0] if '/' in q.get('path',[''])[0] else q.get('path',[''])[0].split(':',1)[0]+':', x.name)})
+                    if not x.is_file() or x.suffix.lower() not in SUB_EXTS: continue
+                    # Match Movie.srt and Movie.en.srt, but not Movie Extended.srt.
+                    subtitle_stem=x.stem.casefold(); video_stem=video.stem.casefold()
+                    if subtitle_stem==video_stem or subtitle_stem.startswith(video_stem+'.') or subtitle_stem.startswith(video_stem+'_'):
+                        parent=raw.rsplit('/',1)[0] if '/' in raw else raw.split(':',1)[0]+':'
+                        subs.append({'name':x.name,'path':child_path(parent,x.name)})
                 return self.send_json({'items':subs})
             if u.path=='/api/poster':
                 raw=q.get('path',[''])[0]
                 p=resolve_path(raw)
                 if not p.is_file() or p.suffix.lower() not in VIDEO_EXTS: return self.send_json({'poster':None,'title':p.stem})
-                cache_key=key_for(p)
+                cache_key=key_for(p); now=int(time.time())
                 with POSTER_LOCK:
                     cached=POSTER_CACHE.get(cache_key)
-                    if cached is not None: return self.send_json(cached)
-                result=lookup_poster(p.name)
-                # Cache only successful lookups. A temporary network failure must not
-                # permanently suppress poster lookup for this file.
-                if result.get('poster'):
+                    if cached is not None:
+                        cached_at=int(cached.get('_cachedAt',0) or 0)
+                        is_negative=not cached.get('poster')
+                        ttl=NEGATIVE_POSTER_TTL_SECONDS if is_negative else POSITIVE_POSTER_TTL_SECONDS
+                        # Legacy positive cache entries without a timestamp remain usable.
+                        if cached_at==0 and not is_negative: return self.send_json({k:v for k,v in cached.items() if not k.startswith('_')})
+                        if cached_at and now-cached_at < ttl:
+                            return self.send_json({k:v for k,v in cached.items() if not k.startswith('_')})
+                        POSTER_CACHE.pop(cache_key,None)
+                # Limit concurrent outbound metadata lookups when a large grid loads.
+                if not POSTER_LOOKUP_SEMAPHORE.acquire(timeout=0.25):
+                    return self.send_json({'poster':None,'title':p.stem,'lookupFailed':True},503)
+                try: result=lookup_poster(p.name)
+                finally: POSTER_LOOKUP_SEMAPHORE.release()
+                if result.get('poster') or not result.get('lookupFailed',False):
+                    cache_record=dict(result); cache_record['_cachedAt']=now
                     with POSTER_LOCK:
-                        POSTER_CACHE[cache_key]=result
+                        POSTER_CACHE[cache_key]=cache_record
                         save_poster_cache()
-                return self.send_json(result)
+                return self.send_json({k:v for k,v in result.items() if not k.startswith('_')})
             if u.path=='/api/progress':
-                p=q.get('path',[''])[0]
-                with LOCK: value=load_db().get(p,0)
+                p=q.get('path',[''])[0]; media=resolve_path(p)
+                if not media.is_file() or media.suffix.lower() not in VIDEO_EXTS: return self.send_json({'positionMs':0})
+                with LOCK: value=PROGRESS_DB.get(p,0)
                 return self.send_json({'positionMs':value})
             if u.path in ('/stream','/subtitle'):
                 p=resolve_path(q.get('path',[''])[0])
@@ -194,11 +237,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if urllib.parse.urlparse(self.path).path!='/api/progress': return self.send_error(404)
         try:
-            data=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0')) or 0)); p=data['path']; pos=max(0,int(data['positionMs']))
-            # Validate path against configured roots before saving state.
-            resolve_path(p)
+            length=int(self.headers.get('Content-Length','0') or 0)
+            if length <= 0 or length > 8192: return self.send_json({'error':'Invalid request size'},400)
+            data=json.loads(self.rfile.read(length)); p=data['path']; pos=max(0,int(data['positionMs']))
+            # Only persist progress for an existing video inside an explicitly shared root.
+            media=resolve_path(p)
+            if not media.is_file() or media.suffix.lower() not in VIDEO_EXTS: return self.send_json({'error':'Not a video file'},400)
             with LOCK:
-                db=load_db(); db[p]=pos; save_db(db)
+                previous=PROGRESS_DB.get(p)
+                PROGRESS_DB[p]=pos
+                try: save_db(PROGRESS_DB)
+                except Exception:
+                    if previous is None: PROGRESS_DB.pop(p,None)
+                    else: PROGRESS_DB[p]=previous
+                    raise
             return self.send_json({'ok':True})
         except Exception as e: return self.send_json({'error':str(e)},400)
 
@@ -208,6 +260,21 @@ def local_ips():
         s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('192.0.2.1',80)); out.append(s.getsockname()[0]); s.close()
     except Exception: pass
     out.append('127.0.0.1'); return list(dict.fromkeys(out))
+
+class LANThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads=True
+    block_on_close=False
+    request_queue_size=32
+
+    def verify_request(self, request, client_address):
+        # Defense in depth: this unauthenticated server is for loopback/private LAN only.
+        try:
+            addr=ipaddress.ip_address(client_address[0])
+            allowed=addr.is_loopback or addr.is_private or addr.is_link_local
+        except ValueError:
+            allowed=False
+        if not allowed: print('[security] rejected non-private client:',client_address[0])
+        return allowed
 
 def main():
     global ROOTS
@@ -220,11 +287,12 @@ def main():
         p=Path(item).expanduser().resolve()
         if not p.is_dir(): ap.error(f'Folder does not exist: {p}')
         ROOTS.append(p)
-    httpd=ThreadingHTTPServer(('0.0.0.0',args.port),Handler)
+    httpd=LANThreadingHTTPServer(('0.0.0.0',args.port),Handler)
     print('\nPCShieldStream server running. Open one of these on Shield:')
     for ip in local_ips(): print(f'  http://{ip}:{args.port}')
     print('Allowed folders:'); [print('  -',p) for p in ROOTS]
-    print('Poster lookup: Cinemeta metadata (cached locally in posters.json)')
+    print('Poster lookup: Cinemeta metadata (positive cache 30 days; no-result cache 6 hours)')
+    print('Security: loopback/private-LAN clients only; also restrict Windows Firewall to Private profile.')
     print('Keep this window open while watching. Ctrl+C to stop.\n')
     try: httpd.serve_forever()
     except KeyboardInterrupt: print('\nStopping server...')

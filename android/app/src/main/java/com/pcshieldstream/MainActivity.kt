@@ -23,6 +23,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import coil.compose.AsyncImage
@@ -32,6 +33,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -123,10 +126,13 @@ private fun ShieldApp() {
         playing = entry
         activity.lifecycleScope.launch {
             try {
-                val position = withContext(Dispatchers.IO) { Api.progress(server, entry.path) }
-                savedPosition = position
+                // Progress API is optional: if it fails, still try to play from the beginning.
+                val position = withContext(Dispatchers.IO) {
+                    runCatching { Api.progress(server, entry.path) }.getOrDefault(0L)
+                }
+                savedPosition = position.coerceAtLeast(0L)
                 val httpFactory = DefaultHttpDataSource.Factory()
-                    .setUserAgent("PCShieldStream/1.1 (Android TV)")
+                    .setUserAgent("PCShieldStream/1.3.0 (Android TV)")
                     .setConnectTimeoutMs(15_000)
                     .setReadTimeoutMs(60_000)
                     .setDefaultRequestProperties(mapOf("Accept" to "*/*", "Connection" to "keep-alive"))
@@ -140,7 +146,14 @@ private fun ShieldApp() {
                         playbackStatus = when (state) {
                             Player.STATE_BUFFERING -> "Đang tải video…"
                             Player.STATE_READY -> "Đang phát"
-                            Player.STATE_ENDED -> "Đã phát hết"
+                            Player.STATE_ENDED -> {
+                                val item = playing
+                                if (item != null) activity.lifecycleScope.launch(Dispatchers.IO) {
+                                    runCatching { Api.saveProgress(server, item.path, 0L) }
+                                }
+                                savedPosition = 0L
+                                "Đã phát hết"
+                            }
                             else -> "Đang chờ trình phát…"
                         }
                     }
@@ -158,7 +171,10 @@ private fun ShieldApp() {
                 })
                 val itemBuilder = MediaItem.Builder().setUri(Api.url(server, "/stream", entry.path)).setMediaId(entry.path)
                 // Attach the first matching sidecar subtitle automatically; users can toggle tracks in the player.
-                val subtitle = withContext(Dispatchers.IO) { Api.subtitles(server, entry.path).firstOrNull() }
+                // A failed sidecar-subtitle request must never prevent video playback.
+                val subtitle = withContext(Dispatchers.IO) {
+                    runCatching { Api.subtitles(server, entry.path).firstOrNull() }.getOrNull()
+                }
                 if (subtitle != null) {
                     val ext = subtitle.name.substringAfterLast('.', "srt").lowercase(Locale.ROOT)
                     val mime = when (ext) { "ass", "ssa" -> "text/x-ssa"; "vtt" -> "text/vtt"; else -> "application/x-subrip" }
@@ -179,7 +195,7 @@ private fun ShieldApp() {
 
     LaunchedEffect(playing, player) {
         while (playing != null && player != null) {
-            delay(5000)
+            delay(15_000)
             val p = player ?: break
             val item = playing ?: break
             val pos = p.currentPosition.coerceAtLeast(0L)
@@ -191,7 +207,7 @@ private fun ShieldApp() {
     fun closePlayback() {
         val activePlayer = player
         val item = playing
-        val position = activePlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        val position = if (activePlayer?.playbackState == Player.STATE_ENDED) 0L else (activePlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L)
         if (activePlayer != null && item != null) {
             activity.lifecycleScope.launch(Dispatchers.IO) {
                 runCatching { Api.saveProgress(server, item.path, position) }
@@ -210,6 +226,22 @@ private fun ShieldApp() {
             val parent = currentPath.substringBeforeLast('/', "")
             request(parent)
         }
+    }
+
+    // Save progress when Android backgrounds the app, not only on the periodic timer.
+    DisposableEffect(player, playing, server) {
+        val activePlayer = player
+        val activeItem = playing
+        val observer = LifecycleEventObserver { _, event ->
+            if ((event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) && activePlayer != null && activeItem != null) {
+                val position = if (activePlayer.playbackState == Player.STATE_ENDED) 0L else activePlayer.currentPosition.coerceAtLeast(0L)
+                activity.lifecycleScope.launch(Dispatchers.IO) {
+                    runCatching { Api.saveProgress(server, activeItem.path, position) }
+                }
+            }
+        }
+        activity.lifecycle.addObserver(observer)
+        onDispose { activity.lifecycle.removeObserver(observer) }
     }
 
     DisposableEffect(player) {
@@ -272,7 +304,7 @@ private fun ShieldApp() {
                     }, modifier = Modifier.fillMaxWidth(), enabled = !loading) { Text(if (loading) "Đang kết nối…" else "Kết nối") }
                     Text(if (connected) "● Đã kết nối" else "○ Chưa kết nối", color = if (connected) Accent else Muted, fontSize = 12.sp)
                     Spacer(Modifier.weight(1f))
-                    Text("PCShieldStream 1.2.0", color = Muted, fontSize = 11.sp)
+                    Text("PCShieldStream 1.3.0", color = Muted, fontSize = 11.sp)
                 }
                 Column(Modifier.fillMaxSize().padding(horizontal = 30.dp, vertical = 24.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
@@ -297,15 +329,21 @@ private fun ShieldApp() {
                             gridItems(visibleEntries, key = { it.path }) { entry ->
                                 var posterUrl by remember(entry.path, server) { mutableStateOf<String?>(null) }
                                 var posterChecked by remember(entry.path, server) { mutableStateOf(false) }
+                                var cardFocused by remember(entry.path) { mutableStateOf(false) }
                                 LaunchedEffect(entry.path, server) {
                                     if (entry.type != "dir" && !posterChecked) {
                                         posterChecked = true
                                         posterUrl = withContext(Dispatchers.IO) { runCatching { Api.poster(server, entry.path) }.getOrNull() }
                                     }
                                 }
-                                Column(Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(14.dp)).border(1.dp, Color(0xFF273448), RoundedCornerShape(14.dp)).clickable {
-                                    if (entry.type == "dir") request(entry.path) else play(entry)
-                                }.focusable().padding(9.dp)) {
+                                val cardShape = RoundedCornerShape(14.dp)
+                                Column(Modifier.fillMaxWidth()
+                                    .background(if (cardFocused) Color(0xFF1C2B40) else Panel, cardShape)
+                                    .border(if (cardFocused) 3.dp else 1.dp, if (cardFocused) Accent else Color(0xFF273448), cardShape)
+                                    .onFocusChanged { cardFocused = it.isFocused }
+                                    .clickable { if (entry.type == "dir") request(entry.path) else play(entry) }
+                                    .focusable()
+                                    .padding(9.dp)) {
                                     Box(Modifier.fillMaxWidth().height(190.dp).background(Color(0xFF202A3A), RoundedCornerShape(9.dp)), contentAlignment = Alignment.Center) {
                                         if (entry.type != "dir" && !posterUrl.isNullOrBlank()) {
                                             AsyncImage(model = posterUrl, contentDescription = entry.name, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())

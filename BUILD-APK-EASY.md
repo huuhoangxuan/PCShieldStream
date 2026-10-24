@@ -1,7 +1,7 @@
 # Build the APK with GitHub Actions
 
 1. Upload/commit this entire source tree to the repository root, preserving `.github/workflows/build-apk.yml`.
-2. Open GitHub → **Actions** → **Build PCShieldStream APK**.
+2. Open GitHub → **Actions** → **Build PCShieldStream 1.3.0 APK**.
 3. If no run started automatically, choose **Run workflow**.
 4. Open the newest run. Wait for the `build` job to show green.
 5. In **Artifacts**, download `PCShieldStream-debug-apk` and extract `app-debug.apk`.
