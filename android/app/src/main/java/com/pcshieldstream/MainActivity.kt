@@ -28,6 +28,10 @@ import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.PlaybackException
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
@@ -76,6 +80,8 @@ private fun ShieldApp() {
     var player by remember { mutableStateOf<ExoPlayer?>(null) }
     var playerView by remember { mutableStateOf<PlayerView?>(null) }
     var savedPosition by remember { mutableLongStateOf(0L) }
+    var playbackError by remember { mutableStateOf("") }
+    var playbackStatus by remember { mutableStateOf("Đang khởi tạo trình phát…") }
 
     fun request(path: String) {
         loading = true; error = ""
@@ -89,12 +95,43 @@ private fun ShieldApp() {
     }
 
     fun play(entry: MediaEntry) {
+        playbackError = ""
+        playbackStatus = "Đang kết nối luồng video…"
         playing = entry
         activity.lifecycleScope.launch {
             try {
                 val position = withContext(Dispatchers.IO) { Api.progress(server, entry.path) }
                 savedPosition = position
-                val exo = ExoPlayer.Builder(context).build()
+                val httpFactory = DefaultHttpDataSource.Factory()
+                    .setUserAgent("PCShieldStream/1.1 (Android TV)")
+                    .setConnectTimeoutMs(15_000)
+                    .setReadTimeoutMs(30_000)
+                    .setAllowCrossProtocolRedirects(true)
+                val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
+                val exo = ExoPlayer.Builder(context)
+                    .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+                    .build()
+                exo.addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(state: Int) {
+                        playbackStatus = when (state) {
+                            Player.STATE_BUFFERING -> "Đang tải video…"
+                            Player.STATE_READY -> "Đang phát"
+                            Player.STATE_ENDED -> "Đã phát hết"
+                            else -> "Đang chờ trình phát…"
+                        }
+                    }
+                    override fun onPlayerError(exception: PlaybackException) {
+                        val cause = exception.cause?.message?.takeIf { it.isNotBlank() }
+                        playbackError = buildString {
+                            append("Không phát được video. ")
+                            append(exception.errorCodeName)
+                            append(": ")
+                            append(cause ?: exception.message ?: "Lỗi không xác định")
+                        }
+                        playbackStatus = "Lỗi trình phát"
+                        android.util.Log.e("PCShieldStream", "ExoPlayer playback error", exception)
+                    }
+                })
                 val itemBuilder = MediaItem.Builder().setUri(Api.url(server, "/stream", entry.path)).setMediaId(entry.path)
                 // Attach the first matching sidecar subtitle automatically; users can toggle tracks in the player.
                 val subtitle = withContext(Dispatchers.IO) { Api.subtitles(server, entry.path).firstOrNull() }
@@ -103,10 +140,17 @@ private fun ShieldApp() {
                     val mime = when (ext) { "ass", "ssa" -> "text/x-ssa"; "vtt" -> "text/vtt"; else -> "application/x-subrip" }
                     itemBuilder.setSubtitleConfigurations(listOf(MediaItem.SubtitleConfiguration.Builder(Uri.parse(Api.url(server, "/subtitle", subtitle.path))).setMimeType(mime).setLanguage("und").setSelectionFlags(C.SELECTION_FLAG_DEFAULT).build()))
                 }
+                player?.release()
+                player = exo
                 exo.setMediaItem(itemBuilder.build(), position)
-                exo.prepare(); exo.playWhenReady = true
-                player?.release(); player = exo
-            } catch (e: Exception) { error = "Không mở được phim: ${e.message}"; playing = null }
+                exo.prepare()
+                exo.playWhenReady = true
+            } catch (e: Exception) {
+                playbackError = "Không mở được phim: ${e.message ?: e.javaClass.simpleName}"
+                android.util.Log.e("PCShieldStream", "Failed to initialize player", e)
+                error = playbackError
+                playing = null
+            }
         }
     }
 
@@ -146,7 +190,10 @@ private fun ShieldApp() {
                         runCatching { TrackSelectionDialogBuilder(activity, "Phụ đề", p, C.TRACK_TYPE_TEXT).build().show() }
                     }) { Text("Phụ đề") }
                     Spacer(Modifier.weight(1f))
-                    Text("Đang phát: ${playing?.name}", color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(2f))
+                    Column(Modifier.weight(2f)) {
+                        Text("${playing?.name ?: ""}", color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(playbackError.ifBlank { playbackStatus }, color = if (playbackError.isBlank()) Muted else Color(0xFFFF9B9B), maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 11.sp)
+                    }
                     OutlinedButton(onClick = {
                         val p = player; val item = playing
                         if (p != null && item != null) activity.lifecycleScope.launch(Dispatchers.IO) { runCatching { Api.saveProgress(server, item.path, p.currentPosition) } }

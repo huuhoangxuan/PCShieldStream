@@ -79,12 +79,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(status); self.send_header('Content-Type',mime); self.send_header('Accept-Ranges','bytes'); self.send_header('Content-Length',str(end-start+1)); self.send_header('Cache-Control','no-store')
                 if status==206: self.send_header('Content-Range',f'bytes {start}-{end}/{size}')
                 self.end_headers()
-                with p.open('rb') as f:
-                    f.seek(start); remaining=end-start+1
-                    while remaining:
-                        chunk=f.read(min(1024*1024,remaining))
-                        if not chunk: break
-                        self.wfile.write(chunk); remaining-=len(chunk)
+                try:
+                    with p.open('rb') as f:
+                        f.seek(start); remaining=end-start+1
+                        while remaining:
+                            chunk=f.read(min(256*1024,remaining))
+                            if not chunk: break
+                            self.wfile.write(chunk); remaining-=len(chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    # Players commonly cancel an HTTP request when probing formats,
+                    # switching tracks, or closing playback. The client disconnect
+                    # is not a server-side 500 error.
+                    print('[stream] client closed connection before transfer completed:', p.name)
                 return
             return self.send_error(404)
         except (ValueError,PermissionError) as e: return self.send_json({'error':str(e)},400)
